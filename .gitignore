@@ -1,0 +1,36 @@
+# --- secrets: never commit cookies, tokens, or any .env ---
+.env
+*.env
+cookies.json
+cookies*.json
+*cookies*.txt
+secrets*
+*.secret
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# --- playwright / browser artifacts ---
+playwright-report/
+test-results/
+*.png
+*.jpg
+*.pdf
+trace.zip
+
+# --- editor / os ---
+.vscode/
+.idea/
+.DS_Store
+*.swp

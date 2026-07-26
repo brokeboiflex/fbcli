@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fbcli"
+version = "0.1.0"
+description = "Cookie-only Facebook command-line client for your own account"
+requires-python = ">=3.9"
+dependencies = ["playwright>=1.40"]
+
+[project.scripts]
+fbcli = "fbcli.cli:main"
+
+[tool.setuptools]
+packages = ["fbcli"]
