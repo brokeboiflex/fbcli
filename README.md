@@ -211,10 +211,12 @@ fbcli search "climbing gym" --kind pages
 fbcli search "nairobi tech" --kind groups --limit 10
 ```
 
-#### `group <id|url> [--limit N]`
-Read a group's feed.
+#### `group <id|url> [--limit N] [--sort new|activity]`
+Read a group's feed, newest post first. `--sort activity` asks for Facebook's
+own order instead, where a post resurfaces whenever somebody replies to it.
 ```bash
 fbcli group 123456789012345 --limit 15
+fbcli group my-group-slug --sort activity
 ```
 
 #### `notifications [--limit N]`
@@ -347,7 +349,13 @@ case-insensitive regex sources matched against accessible names.
    names, which survive Facebook's frequent CSS churn far better than class
    names — and all of them live in one overridable registry (`src/selectors.ts`,
    see [`FBCLI_SELECTORS`](#overriding-selectors-without-editing-code)).
-4. **Real permalinks.** Facebook's on-page timestamp links are JS-obfuscated, so
+4. **Feed-column reads.** Group feeds don't tag their story cards with
+   `role="article"` — only the comment previews inside them are tagged — and a
+   card stays unpainted until it scrolls into view. So `fbcli group` walks the
+   `role="feed"` column's own children, brings each card into view, and takes
+   the longest `dir="auto"` block outside any comment preview as the body,
+   skipping Facebook's hidden decoy text. Older layouts fall back to articles.
+5. **Real permalinks.** Facebook's on-page timestamp links are JS-obfuscated, so
    after you publish, `fbcli` listens to the create-post GraphQL response and
    parses the new story's `pfbid`, returning the canonical
    `https://www.facebook.com/<uid|groups/gid>/posts/<pfbid>` URL.

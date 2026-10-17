@@ -26,6 +26,7 @@ Examples:
   fbcli --cookies brave whoami
   fbcli feed --limit 15
   fbcli search "climbing gyms nairobi" --kind pages
+  fbcli group 123456789 --sort activity
   fbcli --channel chrome post "Hello from my terminal"
   fbcli post "Hi group" --group 123456789 --yes
   fbcli post "friends only" --audience friends
@@ -178,7 +179,16 @@ export function buildParser(): ParserSpec {
         name: "group",
         help: "read a group's feed",
         positionals: [{ dest: "group" }],
-        options: [limitOption(10)],
+        options: [
+          limitOption(10),
+          {
+            flags: ["--sort"],
+            dest: "sort",
+            default: "new",
+            choices: ["new", "activity"],
+            help: "newest posts first (default), or Facebook's recent-activity order",
+          },
+        ],
       },
       {
         name: "creategroup",
@@ -309,7 +319,11 @@ export async function run(args: ParsedArgs): Promise<number> {
         emit(await A.timeline(b, str("target"), num("limit")), asJson, feedShow);
         break;
       case "group":
-        emit(await A.groupFeed(b, str("group"), num("limit")), asJson, feedShow);
+        emit(
+          await A.groupFeed(b, str("group"), num("limit"), str("sort") as A.GroupSort),
+          asJson,
+          feedShow,
+        );
         break;
       case "search": {
         const res = await A.search(b, str("query"), str("kind"), num("limit"));

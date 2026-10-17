@@ -50,7 +50,7 @@ describe("the command surface", () => {
     ["search q", { query: "q", kind: "top", limit: 15 }],
     ["read u", { post: "u" }],
     ["post hello", { text: "hello", group: null }],
-    ["group 123", { group: "123", limit: 10 }],
+    ["group 123", { group: "123", limit: 10, sort: "new" }],
     ["creategroup sandbox", { name: "sandbox", privacy: "private" }],
     ["join 123", { group: "123" }],
     ["leave 123", { group: "123" }],
@@ -76,6 +76,9 @@ describe("the command surface", () => {
     for (const p of ["private", "public"]) {
       expect(parse(`creategroup g --privacy ${p}`)).toMatchObject({ privacy: p });
     }
+    for (const sort of ["new", "activity"]) {
+      expect(parse(`group 123 --sort ${sort}`)).toMatchObject({ sort });
+    }
   });
 
   test("`--` stops flag parsing so text can start with a dash", () => {
@@ -86,6 +89,7 @@ describe("the command surface", () => {
     for (const line of [
       "", "bogus", "search", "comment a", "whoami extra",
       "feed --limit abc", "search q --kind nope", "feed --nope", "feed --limit",
+      "group 123 --sort oldest",
     ]) {
       let code: number | null = null;
       try {

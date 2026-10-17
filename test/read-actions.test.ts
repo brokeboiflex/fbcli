@@ -143,7 +143,64 @@ describe("timeline", () => {
   );
 });
 
+// A group story card as Facebook builds one: the card itself carries no
+// role="article" (its comment previews do), the body sits in a dir="auto" block
+// next to hidden decoy text, and the card is only painted once it is in view.
+function groupCard(author: string, body: string, href: string, comment: string): string {
+  return `<div>
+    <span>Facebook</span>
+    <h3><a href="/user/9/">${author}</a><span>Facebook</span></h3>
+    <div dir="auto">${body}</div>
+    <a href="${href}">6h</a>
+    <div role="article" aria-label="Comment by Nosy Neighbour 2 hours ago">
+      <h3><a href="/user/7/">Nosy Neighbour</a></h3>
+      <div dir="auto">${comment}</div>
+      <a href="${href}?comment_id=5">2h</a>
+    </div>
+  </div>`;
+}
+
+const GROUP = page(`${RECORDER}<div role="main"><div role="feed">
+  <div><div dir="auto">sort group feed by</div></div>
+  ${groupCard("Alice", "the group post body", "/groups/7/posts/111", "a comment that is much, much longer than the post itself")}
+  ${groupCard("Bob", "another group post", "/groups/7/posts/222", "short reply")}
+</div></div>`);
+
 describe("groupFeed", () => {
+  test(
+    "reads the feed column's story cards, not the comments inside them",
+    async () => {
+      await withFakeFB({ html: { "*": GROUP } }, async (b) => {
+        const posts = await A.groupFeed(b, "7", 10);
+        // The sort control has no permalink of its own, so it is not a story.
+        expect(posts.map((p) => p.text)).toEqual([
+          "the group post body",
+          "another group post",
+        ]);
+        expect(posts.map((p) => p.author)).toEqual(["Alice", "Bob"]);
+        expect(posts[0]!.permalink).toBe("https://www.facebook.com/groups/7/posts/111");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "falls back to bare articles when there is no feed column",
+    async () => {
+      const html = page(`${RECORDER}<div role="main">
+        ${article("Alice", "an older-layout story", "/groups/7/posts/1")}
+        <div role="article" aria-label="Comment by Bob 1 hour ago">
+          <div dir="auto">a comment, which is not a story</div>
+        </div>
+      </div>`);
+      await withFakeFB({ html: { "*": html } }, async (b) => {
+        const posts = await A.groupFeed(b, "7", 10);
+        expect(posts.map((p) => p.author)).toEqual(["Alice"]);
+      });
+    },
+    TIMEOUT,
+  );
+
   test(
     "accepts a bare id, a /groups/ path, and a full URL",
     async () => {
@@ -156,6 +213,22 @@ describe("groupFeed", () => {
         }
       });
       expect(seen).toEqual(["/groups/123", "/groups/123", "/groups/123"]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "asks Facebook for newest-first order unless told otherwise",
+    async () => {
+      const seen: string[] = [];
+      const html = page(`${RECORDER}<div role="main">${article("X", "hi", "/x/posts/1")}</div>`);
+      await withFakeFB({ html: { "*": html } }, async (b) => {
+        for (const sort of ["new", "activity"] as const) {
+          await A.groupFeed(b, "123", 1, sort);
+          seen.push(new URL(b.page.url()).searchParams.get("sorting_setting") ?? "");
+        }
+      });
+      expect(seen).toEqual(["CHRONOLOGICAL", "RECENT_ACTIVITY"]);
     },
     TIMEOUT,
   );
@@ -179,6 +252,29 @@ describe("readPost", () => {
         expect(post.text).toBe("The full body of the post, which is the longest block here.");
         expect(post.permalink).toBe("https://www.facebook.com/jane/posts/1");
         expect(comments).toEqual(["nice one!", "agreed, very nice"]);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ignores the comments when one runs longer than the post it answers",
+    async () => {
+      const html = page(`${RECORDER}<div role="main">
+        <h2><a href="/groups/7/">Problems of the Polish IT Industry</a></h2>
+        <a href="/groups/7/user/42/">Michał Kubiak</a>
+        <div dir="auto">a short post</div>
+        <div role="article" aria-label="Comment by Helpful Bob 5 minutes ago">
+          <a href="/groups/7/user/99/">Helpful Bob</a>
+          <div dir="auto">Have you tried turning it off and on again? Also check the VPN.</div>
+        </div>
+      </div>`);
+      await withFakeFB({ html: { "*": html } }, async (b) => {
+        const [post, comments] = await A.readPost(b, "/groups/7/posts/1");
+        // Not the long comment, and not the group — the poster.
+        expect(post.text).toBe("a short post");
+        expect(post.author).toBe("Michał Kubiak");
+        expect(comments[0]).toContain("turning it off and on again");
       });
     },
     TIMEOUT,

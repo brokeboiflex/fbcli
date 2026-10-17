@@ -20,6 +20,14 @@ export interface SelectorDefs {
   // -- CSS queries --
   /** A feed/timeline/group story container. */
   article: string;
+  /** The feed column whose direct children are the story cards. */
+  feed: string;
+  /** A comment preview rendered inside a story card (never a story itself). */
+  commentArticle: string;
+  /** The actor link in a story's header — a link to the poster's profile. */
+  storyAuthor: string;
+  /** Last-resort author links, when the poster has no profile link. */
+  storyAuthorAny: string;
   /** Links inside a story that point at its permalink. */
   permalinkLinks: string;
   /** The post-detail overlay (read view). */
@@ -66,6 +74,10 @@ export interface SelectorDefs {
 
 export const DEFAULT_SELECTORS: SelectorDefs = {
   article: 'div[role="article"]',
+  feed: '[role="feed"]',
+  commentArticle: '[aria-label^="Comment by"], [aria-label^="Reply by"]',
+  storyAuthor: 'a[href*="/user/"], a[href*="profile.php"]',
+  storyAuthorAny: 'h2 a[href], h3 a[href], h4 a[href], a[href]',
   permalinkLinks:
     'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], ' +
     'a[href*="/videos/"], a[href*="/groups/"][href*="/posts/"]',

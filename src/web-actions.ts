@@ -7,7 +7,7 @@
  */
 
 import type { Locator, Response } from "playwright-core";
-import { type Browser, FBError } from "./browser.ts";
+import { FB, type Browser, FBError, isTimeout } from "./browser.ts";
 import { SEL } from "./selectors.ts";
 
 /** Slice by code point, like Python's `s[:n]`, so emoji survive truncation. */
@@ -160,6 +160,8 @@ async function collectArticles(b: Browser, limit: number, scrolls = 6): Promise<
     const n = await arts.count();
     for (let i = 0; i < n; i++) {
       const a = arts.nth(i);
+      // Facebook marks comment previews as articles too; those are not stories.
+      if (await a.evaluate((el, sel) => el.matches(sel), SEL.commentArticle)) continue;
       const txt = await tryInnerText(a, 1500);
       if (txt === null) continue;
       if (!txt || charLength(txt) < 3) continue;
@@ -176,6 +178,130 @@ async function collectArticles(b: Browser, limit: number, scrolls = 6): Promise<
     await b.page.waitForTimeout(1200);
   }
   return posts;
+}
+
+/** What one story card yields before it becomes a `Post`. */
+interface RawStory {
+  author: string;
+  text: string;
+  permalink: string;
+}
+
+/**
+ * Pull a story out of a single feed card, in the page.
+ *
+ * Two Facebook habits make this fiddlier than reading `innerText`: the card
+ * carries hidden decoy text (every other node spells "Facebook"), and the
+ * comment previews under a post are themselves full text blocks. So the body is
+ * the longest `dir="auto"` block that is *not* inside a comment preview — the
+ * same heuristic `readPost` uses on a post page.
+ */
+async function readStoryCard(card: Locator): Promise<RawStory> {
+  return await card.evaluate(
+    (el, sel) => {
+      const root = el as HTMLElement;
+      const inComment = (node: Element): boolean => node.closest(sel.comment) !== null;
+
+      let text = "";
+      for (const block of Array.from(root.querySelectorAll(sel.body))) {
+        if (inComment(block)) continue;
+        const t = (block as HTMLElement).innerText.trim();
+        if (Array.from(t).length > Array.from(text).length) text = t;
+      }
+
+      // Prefer a link to the poster's profile; a heading or any other link is
+      // the fallback for posters who have none (anonymous group members).
+      let author = "";
+      for (const selector of [sel.author, sel.authorAny]) {
+        for (const link of Array.from(root.querySelectorAll(selector))) {
+          if (inComment(link)) continue;
+          const name = (link as HTMLElement).innerText.trim().split("\n")[0] ?? "";
+          // "Facebook" is decoy text, not a person.
+          if (!name || name === "Facebook" || Array.from(name).length > 80) continue;
+          author = name;
+          break;
+        }
+        if (author) break;
+      }
+
+      // A story's own timestamp link is JS-obfuscated, so often the only hrefs
+      // in the card belong to its comment previews — and those point at this
+      // very post, with a `comment_id` query we drop. Hence the fallback.
+      let permalink = "";
+      let viaComment = "";
+      for (const link of Array.from(root.querySelectorAll(sel.permalink))) {
+        const href = (link as HTMLAnchorElement).href.split("?")[0]!;
+        if (inComment(link)) {
+          viaComment ||= href;
+          continue;
+        }
+        permalink = href;
+        break;
+      }
+      return { author, text, permalink: permalink || viaComment };
+    },
+    {
+      body: SEL.bodyBlock,
+      comment: SEL.commentArticle,
+      author: SEL.storyAuthor,
+      authorAny: SEL.storyAuthorAny,
+      permalink: SEL.permalinkLinks,
+    },
+  );
+}
+
+/**
+ * Read the stories out of a `role="feed"` column.
+ *
+ * Group feeds need this rather than `collectArticles`: their story cards are not
+ * `role="article"` at all (only the comment previews inside them are), and
+ * Facebook leaves a card's contents unrendered until it scrolls into view. Walk
+ * the feed's own children instead, bringing each into view before reading it.
+ */
+async function collectStories(b: Browser, limit: number, scrolls = 8): Promise<Post[]> {
+  const feed = b.page.locator(SEL.feed).first();
+  if (!(await feed.count())) return [];
+  const posts: Post[] = [];
+  const seen = new Set<string>();
+  for (let s = 0; s < scrolls; s++) {
+    const cards = feed.locator("> div");
+    const n = await cards.count();
+    for (let i = 0; i < n; i++) {
+      const card = cards.nth(i);
+      try {
+        await card.scrollIntoViewIfNeeded({ timeout: 4000 });
+      } catch (err) {
+        if (!isTimeout(err)) throw err;
+        continue;
+      }
+      // Give the card Facebook just un-hid a moment to paint.
+      await b.page.waitForTimeout(400);
+      let story: RawStory;
+      try {
+        story = await readStoryCard(card);
+      } catch {
+        continue; // the card was recycled out of the DOM mid-read
+      }
+      // Every real story carries a link to itself; the sort control, the
+      // composer and the join/suggestion cards do not.
+      if (!story.permalink) continue;
+      // A photo- or video-only post has no body, but its author still does.
+      if (charLength(story.text) < 3 && !story.author) continue;
+      if (seen.has(story.permalink)) continue;
+      seen.add(story.permalink);
+      posts.push(new Post(story));
+      if (posts.length >= limit) return posts;
+    }
+    await b.page.mouse.wheel(0, 3000);
+    await b.page.waitForTimeout(1200);
+  }
+  return posts;
+}
+
+/** Prefer the feed-column walk, falling back to bare articles (older layouts). */
+async function collectFeed(b: Browser, limit: number): Promise<Post[]> {
+  const stories = await collectStories(b, limit);
+  return stories.length ? stories : await collectArticles(b, limit);
 }
 
 export async function feed(b: Browser, limit = 10): Promise<Post[]> {
@@ -198,34 +324,40 @@ export async function timeline(b: Browser, target = "me", limit = 10): Promise<P
   return await collectArticles(b, limit);
 }
 
-export async function groupFeed(b: Browser, group: string, limit = 10): Promise<Post[]> {
-  await b.goto(groupUrl(group));
+/** How Facebook should order a group's feed: by newest post, or by last reply. */
+export type GroupSort = "new" | "activity";
+
+/** Facebook's own sort keys, as the group URL's `sorting_setting` takes them. */
+const GROUP_SORTING: Record<GroupSort, string> = {
+  new: "CHRONOLOGICAL",
+  activity: "RECENT_ACTIVITY",
+};
+
+export async function groupFeed(
+  b: Browser,
+  group: string,
+  limit = 10,
+  sort: GroupSort = "new",
+): Promise<Post[]> {
+  const url = new URL(groupUrl(group), FB);
+  url.searchParams.set("sorting_setting", GROUP_SORTING[sort]);
+  await b.goto(url.pathname + url.search);
   await b.settle(3500);
-  return await collectArticles(b, limit);
+  return await collectFeed(b, limit);
 }
 
 export async function readPost(b: Browser, url: string): Promise<[Post, string[]]> {
   await b.goto(url);
   await b.settle(3500);
   await b.page.waitForTimeout(1500);
-  // The post body renders in a dir="auto" block (the article inner_text is
-  // often empty). Take the longest such block inside the post dialog/main.
+  // Body and author come out of the post's own card, the same way the feed
+  // reads them — crucially skipping the comments, one of which is often longer
+  // than the post it answers.
   let scope = b.page.locator(SEL.dialog).last();
   if (!(await scope.count())) {
     scope = b.page.locator(SEL.main).first();
   }
-  let text = "";
-  const blocks = scope.locator(SEL.bodyBlock);
-  const nblocks = Math.min(await blocks.count(), 40);
-  for (let i = 0; i < nblocks; i++) {
-    const t = await tryInnerText(blocks.nth(i), 800);
-    if (t === null) continue;
-    if (charLength(t) > charLength(text)) text = t;
-  }
-  // Author = the post's heading link (e.g. "Jane Doe's post" → the name).
-  let author = "";
-  const head = await tryInnerText(scope.getByRole("link").first(), 1500);
-  if (head !== null) author = firstLine(head);
+  const { author, text } = await readStoryCard(scope);
   const comments: string[] = [];
   const cnodes = b.page.locator(SEL.commentNodes);
   const ncomments = Math.min(await cnodes.count(), 30);
