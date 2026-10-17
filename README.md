@@ -6,6 +6,8 @@ No Graph API app, no developer registration, no password stored in the tool. `fb
 
 Written in TypeScript and run directly by [Bun](https://bun.com) — no build step, no transpile, no `node_modules` juggling beyond `bun install`. It depends on `playwright-core` and **downloads no browser of its own**: point it at a browser you already have (`--channel chrome`), one Playwright already cached, or one you install yourself.
 
+It's also built for AI agents to drive: every command speaks JSON, `fbcli schema` describes the whole interface as data, failures come back as typed errors, write actions refuse to fire unattended without `--yes` — and the repo ships [agent instructions and skills](#for-ai-agents).
+
 ```console
 $ fbcli whoami
 Jane Doe  (uid 100000000000000)
@@ -30,6 +32,7 @@ posted ✓
 - [Global flags](#global-flags)
 - [How it works](#how-it-works)
 - [Using it as a library](#using-it-as-a-library)
+- [For AI agents](#for-ai-agents)
 - [Development](#development)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
@@ -171,7 +174,10 @@ fbcli notifications
 
 ## Command reference
 
-Every read command also accepts `--json` for scripting.
+**Every** command accepts `--json`: reads print their data, writes print
+`{"ok":true,"action","result"}`, and failures print
+`{"ok":false,"error":{"kind","message"}}` on stderr. `fbcli schema` prints the
+whole surface as JSON — see [For AI agents](#for-ai-agents).
 
 ### Identity
 
@@ -217,6 +223,15 @@ own order instead, where a post resurfaces whenever somebody replies to it.
 ```bash
 fbcli group 123456789012345 --limit 15
 fbcli group my-group-slug --sort activity
+```
+
+#### `schema`
+Print the entire command surface as JSON — every command, flag, default,
+choice, output shape, exit code and environment variable. Needs no cookies and
+launches no browser, so it's the cheapest way for a script or an agent to
+discover the CLI.
+```bash
+fbcli schema | jq '.commands[] | {name, mutates, output}'
 ```
 
 #### `notifications [--limit N]`
@@ -311,7 +326,7 @@ often irreversible, and a typo publishes it. Two guards stand in front of them:
 | `-y`, `--yes` | Skip the confirmation prompt for write actions |
 | `--headed` | Show the browser window — invaluable for debugging selectors |
 | `--slow <ms>` | Add `slowMo` delay between UI actions |
-| `--json` | Machine-readable JSON output (read commands) |
+| `--json` | Machine-readable JSON output (every command; errors go to stderr as JSON) |
 | `--verbose` | Log each navigation |
 | `--version` | Print version |
 
@@ -388,6 +403,72 @@ management you can drop the `try`/`finally`:
 await using b = await Browser.start(process.env.FBCLI_COOKIES!);
 console.log(await fb.whoami(b));
 ```
+
+---
+
+## For AI agents
+
+fbcli is built to be driven by an agent as well as a human, and the repo ships
+the instructions for both jobs:
+
+- **[AGENTS.md](AGENTS.md)** — the house rules, read by Codex, Claude Code (via
+  [CLAUDE.md](CLAUDE.md)), and anything else that looks for them.
+- **[`.agents/skills/fbcli/`](.agents/skills/fbcli/SKILL.md)** — using fbcli on
+  an account: the safety gate, the JSON contract, and
+  [recipes](.agents/skills/fbcli/references/recipes.md) (feed triage, group
+  monitoring with dedupe, multi-step library sessions).
+- **[`.agents/skills/fbcli-dev/`](.agents/skills/fbcli-dev/SKILL.md)** —
+  changing fbcli itself: the test loop, the four touchpoints a new command
+  needs, and the
+  [selector-drift procedure](.agents/skills/fbcli-dev/references/selector-drift.md).
+
+Both skills follow the [Agent Skills](https://agentskills.io) format and sit in
+`.agents/skills/`, the location Codex, Cursor, Copilot/VS Code and Gemini CLI
+scan; `.claude/skills/` holds symlinks to them for Claude Code. Any other
+agent: hand it `.agents/skills/<name>/SKILL.md` directly — it's plain Markdown.
+
+**A self-describing interface.** `fbcli schema` reports the command surface as
+data, so nothing has to parse `--help` prose or hardcode flags:
+
+```console
+$ fbcli schema | jq '.commands[] | select(.mutates) | .name'
+"post"
+"creategroup"
+"comment"
+"react"
+"dm"
+```
+
+**A predictable contract.**
+
+| Exit | Meaning | Where |
+|---|---|---|
+| `0` | success | data on stdout (JSON with `--json`) |
+| `1` | runtime error | `{"ok":false,"error":{"kind","message"}}` on stderr |
+| `2` | usage error | argparse-style message on stderr |
+| `130` | interrupted | — |
+
+`error.kind` is one of `cookies` (no cookie source), `auth` (session stale or
+checkpointed — only a human can fix it), `confirmation_required` (a write
+action without `--yes`), or `facebook` (the UI didn't behave — often selector
+drift). Branching on `kind` beats matching English.
+
+**Guard rails that assume an unattended caller.** Write actions refuse to run
+without a TTY unless `--yes` is passed, and `--dry-run` (which also honours
+`--json`) previews the exact action without launching a browser:
+
+```console
+$ fbcli post "ship it" --dry-run --json
+{
+  "dryRun": true,
+  "action": "post",
+  "description": "publish a post to your timeline",
+  "sent": false
+}
+```
+
+So the expected agent sequence for anything public is: `--dry-run`, show the
+user the text, then `--yes`.
 
 ---
 
@@ -497,6 +578,11 @@ test/
   cli.test.ts             the command surface, dry-run/confirm, + the fbcli executable
   find-students.test.ts   the group post-id extractors
   fake-facebook.ts        the request-intercepting facebook.com stand-in
+AGENTS.md           house rules for coding agents (CLAUDE.md points here)
+.agents/skills/
+  fbcli/            skill: using fbcli on an account, + recipes
+  fbcli-dev/        skill: changing fbcli, + the selector-drift procedure
+.claude/skills/     symlinks to the above, so Claude Code discovers them
 fbcli.ts            standalone launcher — `bun run fbcli.ts ...`
 fb-find-students.ts group post finder (extracts permalinks from page JSON)
 package.json        deps (playwright-core) + the `fbcli` bin entry

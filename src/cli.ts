@@ -35,15 +35,36 @@ Examples:
   fbcli react <post_url> --reaction love
   fbcli notifications
   fbcli dm 100000000000000 "hey" --yes
+  fbcli schema                      # the whole command surface, as JSON
 
 Cookie source: a file, a 'c_user=..; xs=..' string, or a browser name
 (brave, chrome, chromium, edge, arc) to read that browser's own login.
 `.trim();
 
-function resolveCookies(arg: unknown): string {
+/** The failure classes a caller can branch on, reported by `--json`. */
+type ErrorKind = "cookies" | "confirmation_required" | "auth" | "facebook";
+
+/**
+ * Report a failure. With `--json` it lands on stderr as
+ * `{"ok":false,"error":{"kind","message"}}` so an agent can branch on `kind`
+ * instead of pattern-matching English.
+ */
+function reportError(kind: ErrorKind, message: string, asJson: boolean): void {
+  if (asJson) {
+    console.error(JSON.stringify({ ok: false, error: { kind, message } }));
+  } else {
+    console.error(message);
+  }
+}
+
+function resolveCookies(arg: unknown, asJson: boolean): string {
   const src = (typeof arg === "string" && arg) || process.env.FBCLI_COOKIES;
   if (!src) {
-    console.error("error: no cookies. Pass --cookies <file|string> or set FBCLI_COOKIES.");
+    reportError(
+      "cookies",
+      "error: no cookies. Pass --cookies <file|string> or set FBCLI_COOKIES.",
+      asJson,
+    );
     throw new ExitSignal(1);
   }
   return src;
@@ -62,6 +83,7 @@ const limitOption = (defaultValue: number): Option => ({
   dest: "limit",
   valueType: "int",
   default: defaultValue,
+  help: "how many items to return",
 });
 
 export function buildParser(): ParserSpec {
@@ -233,7 +255,109 @@ export function buildParser(): ParserSpec {
         help: "send a direct message",
         positionals: [{ dest: "thread" }, { dest: "text" }],
       },
+      { name: "schema", help: "print the whole command surface as JSON (for agents)" },
     ],
+  };
+}
+
+/** The JSON shape each command prints under `--json`, reported by `schema`. */
+const OUTPUT_SHAPES: Record<string, string> = {
+  whoami: "WhoAmI",
+  feed: "Post[]",
+  timeline: "Post[]",
+  group: "Post[]",
+  search: "Item[]",
+  read: "PostWithComments",
+  notifications: "Item[]",
+  post: "Post",
+  creategroup: "CreatedGroup",
+  join: "ActionResult",
+  leave: "ActionResult",
+  comment: "ActionResult",
+  react: "ActionResult",
+  dm: "ActionResult",
+  schema: "Schema",
+};
+
+/** Field-by-field description of every shape above. */
+const SHAPES: Record<string, Record<string, string>> = {
+  WhoAmI: { uid: "string", name: "string", profile: "string (url)" },
+  Post: { author: "string", text: "string", permalink: "string (url, may be empty)" },
+  Item: { text: "string", url: "string (url)" },
+  PostWithComments: { post: "Post", comments: "string[]" },
+  CreatedGroup: { name: "string", id: "string", url: "string (url)" },
+  ActionResult: { ok: "true", action: "string (the command)", result: "string (what happened)" },
+  DryRun: {
+    dryRun: "true",
+    action: "string (the command)",
+    description: "string (what it would do)",
+    sent: "false",
+  },
+  Schema: {
+    prog: "string",
+    version: "string",
+    exitCodes: "object (code -> meaning)",
+    errorShape: "object (the --json error envelope)",
+    env: "object (env var -> meaning)",
+    globals: "Option[]",
+    commands: "Command[]",
+    shapes: "object (shape name -> fields)",
+  },
+};
+
+function optionSchema(o: Option): Record<string, unknown> {
+  const storeTrue = o.action === "storeTrue";
+  return {
+    flags: o.flags,
+    dest: o.dest,
+    type: storeTrue ? "boolean" : (o.valueType ?? "string"),
+    default: storeTrue ? false : (o.default ?? null),
+    choices: o.choices ?? null,
+    help: o.help ?? null,
+  };
+}
+
+/**
+ * The command surface as data, so an agent can discover every command, flag,
+ * default and output shape without parsing `--help` prose.
+ */
+export function schema(): Record<string, unknown> {
+  const spec = buildParser();
+  return {
+    prog: spec.prog,
+    version: VERSION,
+    exitCodes: {
+      "0": "success",
+      "1": "runtime error — see the error envelope on stderr",
+      "2": "usage error (argparse-style message on stderr, never JSON)",
+      "130": "interrupted (SIGINT)",
+    },
+    errorShape: { ok: false, error: { kind: "cookies|confirmation_required|auth|facebook", message: "string" } },
+    /** What a `mutates` command prints instead of its own shape under `--dry-run`. */
+    dryRunOutput: "DryRun",
+    env: {
+      FBCLI_COOKIES: "default --cookies value: a file, a 'c_user=..; xs=..' string, or a browser name",
+      FBCLI_BROWSER: "default --browser-path value",
+      FBCLI_BROWSER_CHANNEL: "default --channel value",
+      FBCLI_SELECTORS: "JSON file overriding entries of the selector registry",
+    },
+    globals: spec.options.map(optionSchema),
+    commands: spec.subcommands.map((sub) => ({
+      name: sub.name,
+      help: sub.help,
+      mutates: MUTATIONS.has(sub.name),
+      needsConfirmation: MUTATIONS.has(sub.name)
+        ? "pass --yes to run non-interactively, or --dry-run to preview"
+        : null,
+      positionals: (sub.positionals ?? []).map((p) => ({
+        dest: p.dest,
+        required: p.optional !== true,
+        default: p.default ?? null,
+      })),
+      options: (sub.options ?? []).map(optionSchema),
+      output: OUTPUT_SHAPES[sub.name] ?? null,
+    })),
+    shapes: SHAPES,
   };
 }
 
@@ -262,13 +386,15 @@ function describeMutation(args: ParsedArgs): string {
 }
 
 /** Return true to proceed. On a TTY, prompt; otherwise require --yes. */
-function confirmMutation(args: ParsedArgs): boolean {
+function confirmMutation(args: ParsedArgs, asJson: boolean): boolean {
   if (args.yes === true) return true;
   const desc = describeMutation(args);
   if (!process.stdin.isTTY) {
-    console.error(
+    reportError(
+      "confirmation_required",
       `refusing to ${desc} without confirmation — re-run with --yes ` +
         `(or --dry-run to preview). This guard prevents accidental posts.`,
+      asJson,
     );
     return false;
   }
@@ -286,19 +412,33 @@ export async function run(args: ParsedArgs): Promise<number> {
   const feedShow = (ps: A.Post[]): void =>
     console.log(ps.map((p) => p.brief()).join("\n\n") || "(nothing to show)");
 
+  // Actions whose only outcome is "it happened": prose for humans, an
+  // ActionResult for `--json`.
+  const action = (cmd: string, result: string): void =>
+    emit({ ok: true, action: cmd, result }, asJson, (r) => console.log(r.result));
+
+  // `schema` is pure introspection: no cookies, no browser, always JSON.
+  if (args.cmd === "schema") {
+    console.log(JSON.stringify(schema(), null, 2));
+    return 0;
+  }
+
   // Gate write actions before we even launch a browser.
   if (MUTATIONS.has(args.cmd)) {
     if (args.dryRun === true) {
-      console.log(`[dry-run] would ${describeMutation(args)} — nothing sent.`);
+      const description = describeMutation(args);
+      emit({ dryRun: true, action: args.cmd, description, sent: false }, asJson, (d) =>
+        console.log(`[dry-run] would ${d.description} — nothing sent.`),
+      );
       return 0;
     }
-    if (!confirmMutation(args)) {
-      console.error("aborted.");
+    if (!confirmMutation(args, asJson)) {
+      if (!asJson) console.error("aborted.");
       return 1;
     }
   }
 
-  const b = await Browser.start(resolveCookies(args.cookies), {
+  const b = await Browser.start(resolveCookies(args.cookies, asJson), {
     headed: args.headed === true,
     slow: num("slow"),
     verbose: args.verbose === true,
@@ -360,16 +500,16 @@ export async function run(args: ParsedArgs): Promise<number> {
         break;
       }
       case "join":
-        console.log(await A.joinGroup(b, str("group")));
+        action("join", await A.joinGroup(b, str("group")));
         break;
       case "leave":
-        console.log(await A.leaveGroup(b, str("group")));
+        action("leave", await A.leaveGroup(b, str("group")));
         break;
       case "comment":
-        console.log(await A.comment(b, str("post"), str("text")));
+        action("comment", await A.comment(b, str("post"), str("text")));
         break;
       case "react":
-        console.log(await A.react(b, str("post"), str("reaction")));
+        action("react", await A.react(b, str("post"), str("reaction")));
         break;
       case "notifications":
         emit(await A.notifications(b, num("limit")), asJson, (ns) =>
@@ -377,7 +517,7 @@ export async function run(args: ParsedArgs): Promise<number> {
         );
         break;
       case "dm":
-        console.log(await A.sendMessage(b, str("thread"), str("text")));
+        action("dm", await A.sendMessage(b, str("thread"), str("text")));
         break;
       default:
         return 2;
@@ -396,16 +536,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     if (err instanceof ExitSignal) return err.code;
     throw err;
   }
+  const asJson = args.json === true;
   try {
     return await run(args);
   } catch (err) {
     if (err instanceof ExitSignal) return err.code;
     if (err instanceof NotLoggedIn) {
-      console.error(`auth error: ${err.message}`);
+      reportError("auth", `auth error: ${err.message}`, asJson);
       return 1;
     }
     if (err instanceof FBError) {
-      console.error(`error: ${err.message}`);
+      reportError("facebook", `error: ${err.message}`, asJson);
       return 1;
     }
     throw err;

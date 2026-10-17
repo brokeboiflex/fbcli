@@ -1,16 +1,17 @@
 import { describe, expect, test } from "bun:test";
 
 import { ExitSignal, parseArgs } from "../src/argparse.ts";
-import { buildParser } from "../src/cli.ts";
+import { buildParser, schema } from "../src/cli.ts";
 
 const spec = buildParser();
 const parse = (line: string) => parseArgs(spec, line.split(" ").filter(Boolean));
 
 describe("the command surface", () => {
-  test("every subcommand from the Python argparse tree is present", () => {
+  test("every subcommand from the Python argparse tree is present, plus `schema`", () => {
     expect(spec.subcommands.map((s) => s.name)).toEqual([
       "whoami", "feed", "timeline", "search", "read", "post", "group",
       "creategroup", "join", "leave", "comment", "react", "notifications", "dm",
+      "schema",
     ]);
   });
 
@@ -58,6 +59,7 @@ describe("the command surface", () => {
     ["react u", { post: "u", reaction: "like" }],
     ["notifications", { limit: 15 }],
     ["dm 100 hey", { thread: "100", text: "hey" }],
+    ["schema", {}],
   ])("`%s` parses with the documented defaults", (line, expected) => {
     expect(parse(line)).toMatchObject(expected as Record<string, unknown>);
   });
@@ -111,6 +113,58 @@ describe("the command surface", () => {
       }
       expect(code).toBe(0);
     }
+  });
+});
+
+describe("the machine-readable schema", () => {
+  const s = schema();
+  const commands = s.commands as Array<Record<string, unknown>>;
+
+  test("describes every command, with its output shape", () => {
+    expect(commands.map((c) => c.name)).toEqual(spec.subcommands.map((sub) => sub.name));
+    for (const c of commands) {
+      expect(typeof c.help).toBe("string");
+      // Every command prints something documented under --json.
+      expect(Object.keys(s.shapes as object)).toContain(
+        String(c.output).replace(/\[\]$/, ""),
+      );
+    }
+  });
+
+  test("flags write actions and how to run them unattended", () => {
+    const byName = new Map(commands.map((c) => [c.name, c]));
+    for (const name of ["post", "comment", "react", "dm", "creategroup"]) {
+      expect(byName.get(name)).toMatchObject({ mutates: true });
+      expect(byName.get(name)!.needsConfirmation).toContain("--yes");
+    }
+    for (const name of ["feed", "whoami", "search", "schema"]) {
+      expect(byName.get(name)).toMatchObject({ mutates: false, needsConfirmation: null });
+    }
+  });
+
+  test("carries each command's own flags, defaults and choices", () => {
+    const search = commands.find((c) => c.name === "search")!;
+    expect(search.options).toEqual([
+      { flags: ["--kind"], dest: "kind", type: "string", default: "top",
+        choices: ["top", "posts", "people", "pages", "groups"], help: null },
+      { flags: ["--limit"], dest: "limit", type: "int", default: 15, choices: null,
+        help: "how many items to return" },
+    ]);
+    expect(search.positionals).toEqual([{ dest: "query", required: true, default: null }]);
+    const timeline = commands.find((c) => c.name === "timeline")!;
+    expect(timeline.positionals).toEqual([{ dest: "target", required: false, default: "me" }]);
+  });
+
+  test("documents the globals, exit codes, env vars and error envelope", () => {
+    const globals = s.globals as Array<Record<string, unknown>>;
+    expect(globals.map((g) => g.dest)).toContain("cookies");
+    expect(globals.find((g) => g.dest === "json")).toMatchObject({ type: "boolean", default: false });
+    expect(Object.keys(s.exitCodes as object)).toEqual(["0", "1", "2", "130"]);
+    expect(Object.keys(s.env as object)).toContain("FBCLI_COOKIES");
+    expect(s.errorShape).toMatchObject({ ok: false });
+    expect(s.dryRunOutput).toBe("DryRun");
+    expect(s.shapes).toHaveProperty("DryRun");
+    expect(s.version).toBe("0.2.0");
   });
 });
 
@@ -180,6 +234,40 @@ describe("the fbcli executable", () => {
     expect(exitCode).toBe(1);
     expect(stderr).toContain("refusing to send a direct message to 100");
     expect(stderr).toContain("aborted.");
+  });
+
+  test("`schema` prints parseable JSON with no cookies and no browser", async () => {
+    const { stdout, exitCode } = await run(["schema"]);
+    expect(exitCode).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.prog).toBe("fbcli");
+    expect(parsed.commands.map((c: { name: string }) => c.name)).toContain("feed");
+  });
+
+  test("--json turns the dry-run preview into an object", async () => {
+    const { stdout, exitCode } = await run(["post", "hi", "--group", "123", "--dry-run", "--json"]);
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(stdout)).toEqual({
+      dryRun: true,
+      action: "post",
+      description: "publish a post to group 123",
+      sent: false,
+    });
+  });
+
+  test("--json reports errors as an envelope on stderr, keyed by kind", async () => {
+    const cookies = await run(["whoami", "--json"]);
+    expect(cookies.exitCode).toBe(1);
+    expect(cookies.stdout).toBe("");
+    expect(JSON.parse(cookies.stderr).error.kind).toBe("cookies");
+
+    const auth = await run(["whoami", "--json", "--cookies", "datr=onlythis"]);
+    expect(auth.exitCode).toBe(1);
+    expect(JSON.parse(auth.stderr).error).toMatchObject({ kind: "auth" });
+
+    const unconfirmed = await run(["dm", "100", "hey", "--json"]);
+    expect(unconfirmed.exitCode).toBe(1);
+    expect(JSON.parse(unconfirmed.stderr).error.kind).toBe("confirmation_required");
   });
 
   test("read actions are never gated by the write guard", async () => {
