@@ -2,9 +2,9 @@
 
 **A command-line client for your own Facebook account — authenticated with nothing but your browser session cookies.**
 
-No Graph API app, no developer registration, no password stored in the tool. `fbcli` injects your exported cookies into a headless Chromium (via [Playwright](https://playwright.dev/)) and drives the **real Facebook web UI**, so it can read your feed, search, post to your timeline or a group, comment, react, and manage group membership — all from your terminal.
+No Graph API app, no developer registration, no password stored in the tool. `fbcli` injects your cookies into a headless Chromium (via [Playwright](https://playwright.dev/)) and drives the **real Facebook web UI**, so it can read your feed, search, post to your timeline or a group, comment, react, and manage group membership — all from your terminal. It can even read the cookies straight out of your everyday browser (`--cookies brave`).
 
-Written in TypeScript and run directly by [Bun](https://bun.com) — no build step, no transpile, no `node_modules` juggling beyond `bun install`.
+Written in TypeScript and run directly by [Bun](https://bun.com) — no build step, no transpile, no `node_modules` juggling beyond `bun install`. It depends on `playwright-core` and **downloads no browser of its own**: point it at a browser you already have (`--channel chrome`), one Playwright already cached, or one you install yourself.
 
 ```console
 $ fbcli whoami
@@ -61,10 +61,21 @@ Requires **[Bun](https://bun.com) 1.1+**. (Install it with `curl -fsSL https://b
 git clone https://github.com/0xEnc0der/fbcli.git
 cd fbcli
 
-bun install    # also downloads Chromium (~150 MB) via Playwright's postinstall
+bun install    # installs playwright-core only — no ~150 MB browser download
 ```
 
-If you skipped the postinstall or need the browser again:
+`fbcli` needs *a* Chromium-family browser to drive, but it won't fetch one for
+you. Pick whichever you already have:
+
+```bash
+fbcli --channel chrome whoami          # use installed Google Chrome
+fbcli --channel msedge whoami          # use installed Microsoft Edge
+fbcli --browser-path /path/to/chromium whoami
+export FBCLI_BROWSER=/path/to/chromium # same, as an env default
+```
+
+If you'd rather have a dedicated managed Chromium (and have Playwright
+installed), download one once — it lands in the shared cache fbcli also reads:
 
 ```bash
 bunx playwright install chromium
@@ -87,6 +98,30 @@ Without `bun link` you run it as `bun run fbcli.ts <command>`.
 ## Getting your cookies
 
 `fbcli` needs the cookies from a browser where you are already logged in.
+
+### Easiest: read them straight from your browser
+
+If you're logged into Facebook in Brave, Chrome, Chromium, Edge, or Arc, pass
+the **browser's name** as the cookie source and fbcli decrypts its cookie store
+for you:
+
+```bash
+fbcli --cookies brave whoami
+fbcli --cookies chrome feed
+fbcli --cookies "chrome:Profile 1" whoami   # a non-default profile
+```
+
+- **macOS** shows a one-time Keychain prompt the first time (the OS asking
+  whether this tool may read the browser's secrets — say yes). Supported.
+- **Linux** works only for "basic" (non-keyring) cookie storage; a
+  gnome-keyring/kwallet profile needs the manual export below.
+- **Windows** is **not** supported here (App-Bound Encryption blocks it) — use
+  the manual export below.
+
+> This decrypts your live Facebook session. Treat the convenience like the
+> password it effectively is, and only use it on a machine you trust.
+
+### Manual export (works everywhere)
 
 1. Log into Facebook in your normal browser.
 2. Export cookies with a browser extension:
@@ -111,6 +146,7 @@ export FBCLI_COOKIES=./cookies.json
 | Simple JSON object | `{"c_user":"100…","xs":"…"}` |
 | Netscape `cookies.txt` | the tab-separated format from curl/wget/yt-dlp |
 | Raw header string | `"c_user=100…; xs=…; datr=…"` |
+| Browser name | `brave`, `chrome`, `chromium`, `edge`, `arc` (optionally `chrome:Profile 1`) |
 
 > 🔒 **Cookies are live session credentials.** `chmod 600` the file, never commit
 > it (this repo's `.gitignore` already excludes `*.env`, `cookies*.json`, etc.),
@@ -189,16 +225,24 @@ fbcli notifications --limit 20
 
 ### Writing
 
-#### `post "<text>" [--group <id|url>]`
+#### `post "<text>" [--group <id|url>] [--audience public|friends|only_me]`
 Publish a text status to your timeline, or into a group with `--group`.
 **Returns the permalink of the new post** (captured from Facebook's own
 create-post response — see [How it works](#how-it-works)).
 ```bash
 fbcli post "Just shipped a new feature 🚀"
 fbcli post "Hi group 👋" --group 123456789012345
+fbcli post "friends only" --audience friends    # refuse to publish if wider
 ```
 > If the group requires admin approval, the post is submitted to the pending
 > queue (it won't appear to members until an admin approves it).
+
+> **`--audience` is a safety check, not a setter.** The composer inherits
+> whatever audience you last used (which might be *Public*). With `--audience`,
+> fbcli reads the composer's current audience and **refuses to publish** unless
+> it matches — failing closed if it can't read it. It never *changes* the
+> audience for you; set that in Facebook, then post. (Timeline posts only — a
+> group post's audience is the group.)
 
 #### `comment <url> "<text>"`
 Comment on a post.
@@ -234,29 +278,75 @@ fbcli join 123456789012345
 fbcli leave 123456789012345
 ```
 
+### Write-action safety
+
+Write actions — `post`, `comment`, `react`, `dm`, `creategroup` — are public and
+often irreversible, and a typo publishes it. Two guards stand in front of them:
+
+- **`--dry-run`** prints what *would* happen and exits without launching a
+  browser or sending anything:
+  ```bash
+  $ fbcli post "wait, is this the right account?" --dry-run
+  [dry-run] would publish a post to your timeline — nothing sent.
+  ```
+- **Confirmation.** On an interactive terminal you're asked `Continue? [y/N]`.
+  In a script (no TTY) the action **refuses to run** unless you pass `--yes`, so
+  a stray `fbcli post …` in a pipeline can't publish silently.
+  ```bash
+  fbcli dm 100000000000000 "on my way" --yes   # no prompt, send it
+  ```
+
 ---
 
 ## Global flags
 
 | Flag | Description |
 |---|---|
-| `--cookies <file\|string>` | Cookie source (or set `FBCLI_COOKIES`) |
+| `--cookies <file\|string\|browser>` | Cookie source: a file, a `c_user=…; xs=…` string, or a browser name (or set `FBCLI_COOKIES`) |
+| `--channel <name>` | Launch a system browser by channel — `chrome`, `msedge`, … (or `FBCLI_BROWSER_CHANNEL`) |
+| `--browser-path <path>` | Launch a specific browser binary (or `FBCLI_BROWSER`) |
+| `--dry-run` | Write actions: show what would happen, then exit without doing it |
+| `-y`, `--yes` | Skip the confirmation prompt for write actions |
 | `--headed` | Show the browser window — invaluable for debugging selectors |
 | `--slow <ms>` | Add `slowMo` delay between UI actions |
 | `--json` | Machine-readable JSON output (read commands) |
 | `--verbose` | Log each navigation |
 | `--version` | Print version |
 
+### Choosing which browser to drive
+
+In precedence order: `--browser-path` / `FBCLI_BROWSER` → `--channel` /
+`FBCLI_BROWSER_CHANNEL` → a Chromium in Playwright's shared cache. If none
+resolve, fbcli prints exactly how to point it at a browser instead of a stack
+trace.
+
+### Overriding selectors without editing code
+
+Facebook's DOM shifts. Every selector fbcli relies on lives in one registry
+(`src/selectors.ts`); override just the ones that broke via a JSON file, no code
+change or release needed:
+
+```bash
+echo '{ "article": "div[data-newhook]", "postButton": "^Publish$" }' > sel.json
+FBCLI_SELECTORS=./sel.json fbcli feed
+```
+
+CSS entries are query strings; name entries (`postButton`, `likeButton`, …) are
+case-insensitive regex sources matched against accessible names.
+
 ---
 
 ## How it works
 
-1. **Cookie injection.** Your exported cookies are normalized (any of the four
-   formats above) and loaded into a fresh Playwright browser context.
-2. **Login guard.** Every navigation checks for a redirect to `/login` or
-   `/checkpoint` and fails fast with a clear message if your session is stale.
+1. **Cookie injection.** Your cookies are normalized (any of the formats above,
+   or decrypted from your browser) and loaded into a fresh Playwright context.
+2. **Login guard.** Every navigation checks for a redirect to `/login`,
+   `/checkpoint`, two-factor, or recovery and fails fast with a clear message if
+   your session is stale. Expired `c_user`/`xs` are also warned about up front.
 3. **Semantic selectors.** Reads and writes target ARIA roles and accessible
-   names, which survive Facebook's frequent CSS churn far better than class names.
+   names, which survive Facebook's frequent CSS churn far better than class
+   names — and all of them live in one overridable registry (`src/selectors.ts`,
+   see [`FBCLI_SELECTORS`](#overriding-selectors-without-editing-code)).
 4. **Real permalinks.** Facebook's on-page timestamp links are JS-obfuscated, so
    after you publish, `fbcli` listens to the create-post GraphQL response and
    parses the new story's `pfbid`, returning the canonical
@@ -331,8 +421,9 @@ supported entry point rather than a bare `bun test`.
 | `auth error: … redirected to login/checkpoint` | Cookies expired or a security check is pending — re-export fresh cookies from a logged-in browser. |
 | `Missing essential cookie(s): c_user, xs` | Your export didn't include the session cookies. Re-export and make sure you're logged in. |
 | A read command returns `(nothing to show)` | Could be genuinely empty (e.g. a new account with no friends), or a selector drifted — run with `--headed` to watch. |
-| `Could not open the post composer` | Facebook changed the composer; run `--headed --slow 300` to observe, then adjust `src/web-actions.ts`. |
-| `browserType.launch: Executable doesn't exist` | `bunx playwright install chromium` |
+| `Could not open the post composer` | Facebook changed the composer; run `--headed --slow 300` to observe, then override via `FBCLI_SELECTORS` or edit `src/selectors.ts`. |
+| `No browser found to drive Facebook` | Pass `--channel chrome` (or `--browser-path`), set `FBCLI_BROWSER`, or `bunx playwright install chromium`. |
+| `Could not read "… Safe Storage" from the macOS Keychain` | Approve the Keychain prompt, or fall back to a file export with `--cookies <file>`. |
 | Chromium won't launch (Linux) | `sudo bunx playwright install-deps chromium` |
 
 Run any command with `--headed --verbose` to watch the browser and see each
@@ -380,23 +471,27 @@ The software is provided **as-is**, without warranty (see [LICENSE](LICENSE)).
 
 ```
 src/
-  browser.ts        Playwright engine: cookie injection, navigation, login guard
-  web-actions.ts    every command's UI flow (read + write)
-  cli.ts            command surface + output formatting
-  argparse.ts       the small argparse-shaped parser the CLI is declared with
-  index.ts          public exports
-  version.ts        the version string the CLI reports
+  browser.ts          Playwright engine: cookie injection, browser resolution, login guard
+  browser-cookies.ts  decrypt Facebook cookies from a local Chromium browser
+  selectors.ts        the one overridable registry of every FB selector
+  web-actions.ts      every command's UI flow (read + write)
+  cli.ts              command surface, safety guards, output formatting
+  argparse.ts         the small argparse-shaped parser the CLI is declared with
+  index.ts            public exports
+  version.ts          the version string the CLI reports
 test/
-  cookies.test.ts       all four cookie formats
-  helpers.test.ts       pure helpers, checked against Python's reference output
-  read-actions.test.ts  feed/timeline/search/notifications/read in real Chromium
-  write-actions.test.ts post/comment/react/join/leave/dm/creategroup likewise
-  cli.test.ts           the command surface + the fbcli executable itself
-  find-students.test.ts the group post-id extractors
-  fake-facebook.ts      the request-intercepting facebook.com stand-in
+  cookies.test.ts         all cookie formats
+  browser-cookies.test.ts the decryption pipeline + browser-keyword detection
+  selectors.test.ts       the registry and its FBCLI_SELECTORS overrides
+  helpers.test.ts         pure helpers, checked against Python's reference output
+  read-actions.test.ts    feed/timeline/search/notifications/read in real Chromium
+  write-actions.test.ts   post/comment/react/join/leave/dm/creategroup + audience guard
+  cli.test.ts             the command surface, dry-run/confirm, + the fbcli executable
+  find-students.test.ts   the group post-id extractors
+  fake-facebook.ts        the request-intercepting facebook.com stand-in
 fbcli.ts            standalone launcher — `bun run fbcli.ts ...`
 fb-find-students.ts group post finder (extracts permalinks from page JSON)
-package.json        deps + the `fbcli` bin entry
+package.json        deps (playwright-core) + the `fbcli` bin entry
 tsconfig.json       strict TypeScript config
 ```
 

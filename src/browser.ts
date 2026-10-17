@@ -16,7 +16,9 @@ import {
   type Browser as PWBrowser,
   type BrowserContext,
   type Page,
-} from "playwright";
+} from "playwright-core";
+
+import { cookiesFromBrowser, isBrowserKeyword } from "./browser-cookies.ts";
 
 export const FB = "https://www.facebook.com";
 const ESSENTIAL = ["c_user", "xs"] as const;
@@ -124,8 +126,34 @@ function parseNetscapeCookies(text: string): RawCookie[] {
   return out;
 }
 
-/** Return a Playwright-ready cookie list from a file or inline string. */
+/**
+ * Warn (but don't fail) when an essential cookie has already expired — turns a
+ * confusing mid-run login redirect into an actionable "re-export your cookies".
+ */
+export function staleCookies(cookies: PWCookie[], now = Date.now() / 1000): string[] {
+  return cookies
+    .filter((c) => ESSENTIAL.includes(c.name as (typeof ESSENTIAL)[number]))
+    .filter((c) => c.expires !== undefined && c.expires > 0 && c.expires < now)
+    .map((c) => c.name);
+}
+
+/** Return a Playwright-ready cookie list from a file, inline string, or browser. */
 export function loadCookies(source: string): PWCookie[] {
+  // A bare browser name ("brave", "chrome:Profile 1") means: read that browser's
+  // encrypted cookie store directly. Opt-in only — never auto-detected.
+  if (isBrowserKeyword(source)) {
+    const out = cookiesFromBrowser(source);
+    const names = new Set(out.map((c) => c.name));
+    const missing = ESSENTIAL.filter((n) => !names.has(n));
+    if (missing.length) {
+      throw new NotLoggedIn(
+        `Missing essential cookie(s): ${missing.join(", ")}. ` +
+          `Log in to Facebook in that browser first.`,
+      );
+    }
+    return out;
+  }
+
   let raw: RawCookie[] = [];
   let isFile = false;
   try {
@@ -203,6 +231,10 @@ export interface BrowserOptions {
   slow?: number;
   verbose?: boolean;
   timeout?: number;
+  /** Launch a system browser by Playwright channel ("chrome", "msedge", …). */
+  channel?: string;
+  /** Launch a specific browser binary instead of a downloaded Chromium. */
+  executablePath?: string;
 }
 
 /** A Playwright browser with FB cookies pre-loaded; `open()` then `close()`. */
@@ -214,6 +246,8 @@ export class Browser {
   readonly slow: number;
   readonly verbose: boolean;
   readonly timeout: number;
+  readonly channel: string | undefined;
+  readonly executablePath: string | undefined;
 
   private pwBrowser: PWBrowser | null = null;
   ctx: BrowserContext | null = null;
@@ -230,19 +264,21 @@ export class Browser {
     this.slow = opts.slow ?? 0;
     this.verbose = opts.verbose ?? false;
     this.timeout = opts.timeout ?? 30000;
+    this.channel = opts.channel ?? process.env.FBCLI_BROWSER_CHANNEL ?? undefined;
+    this.executablePath = opts.executablePath ?? process.env.FBCLI_BROWSER ?? undefined;
+
+    const stale = staleCookies(this.cookies);
+    if (stale.length) {
+      console.error(
+        `warning: cookie(s) ${stale.join(", ")} look expired — ` +
+          `if Facebook bounces you to login, re-export fresh cookies.`,
+      );
+    }
   }
 
-  /** Launch Chromium, build the cookie-loaded context, and open a page. */
+  /** Resolve a browser (channel / binary / cache), build the cookie-loaded context, open a page. */
   async open(): Promise<this> {
-    this.pwBrowser = await chromium.launch({
-      headless: !this.headed,
-      args: [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
-      ],
-      slowMo: this.slow,
-    });
+    this.pwBrowser = await this.launch();
     this.ctx = await this.pwBrowser.newContext({
       userAgent: this.ua,
       viewport: { width: 1280, height: 900 },
@@ -252,6 +288,35 @@ export class Browser {
     await this.ctx.addCookies(this.cookies);
     this.page = await this.ctx.newPage();
     return this;
+  }
+
+  /** Launch Chromium, preferring a system browser so nothing has to be downloaded. */
+  private async launch(): Promise<PWBrowser> {
+    const launchOpts: Parameters<typeof chromium.launch>[0] = {
+      headless: !this.headed,
+      args: [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+      ],
+      slowMo: this.slow,
+    };
+    if (this.executablePath) launchOpts.executablePath = this.executablePath;
+    else if (this.channel) launchOpts.channel = this.channel;
+    try {
+      return await chromium.launch(launchOpts);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/Executable doesn'?t exist|looks like .*not been downloaded|channel/i.test(msg)) {
+        throw new FBError(
+          "No browser found to drive Facebook. Point fbcli at one with " +
+            "--channel chrome (or --browser-path <binary>), set FBCLI_BROWSER, " +
+            "or install one with `bunx playwright install chromium`.\n" +
+            `(underlying: ${msg.split("\n")[0]})`,
+        );
+      }
+      throw err;
+    }
   }
 
   async close(): Promise<void> {
@@ -286,7 +351,15 @@ export class Browser {
 
   private guardLogin(): void {
     const u = this.page.url().toLowerCase();
-    if (u.includes("/login") || u.includes("/checkpoint") || u.includes("login.php")) {
+    const markers = [
+      "/login",
+      "login.php",
+      "/checkpoint",
+      "/two_step_verification",
+      "two_factor",
+      "/recover",
+    ];
+    if (markers.some((m) => u.includes(m))) {
       throw new NotLoggedIn(
         "Facebook redirected to login/checkpoint — cookies expired or a " +
           "security check is required. Re-export fresh cookies.",

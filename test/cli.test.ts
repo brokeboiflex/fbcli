@@ -18,6 +18,10 @@ describe("the command surface", () => {
     expect(parse("whoami")).toEqual({
       cookies: null,
       headed: false,
+      channel: null,
+      browserPath: null,
+      dryRun: false,
+      yes: false,
       slow: 0.0,
       json: false,
       verbose: false,
@@ -124,7 +128,7 @@ describe("the fbcli executable", () => {
 
   test("--version prints the package version", async () => {
     const { stdout, exitCode } = await run(["--version"]);
-    expect(stdout.trim()).toBe("fbcli 0.1.0");
+    expect(stdout.trim()).toBe("fbcli 0.2.0");
     expect(exitCode).toBe(0);
   });
 
@@ -152,5 +156,32 @@ describe("the fbcli executable", () => {
     const { stderr, exitCode } = await run(["whoami", "--cookies", "datr=onlythis"]);
     expect(exitCode).toBe(1);
     expect(stderr).toContain("auth error: Missing essential cookie(s): c_user, xs.");
+  });
+
+  test("--dry-run previews a write action and exits 0 without a browser", async () => {
+    const { stdout, exitCode } = await run(["post", "hello there", "--dry-run"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("[dry-run] would publish a post to your timeline");
+  });
+
+  test("--dry-run names the group and audience when given", async () => {
+    const g = await run(["post", "hi", "--group", "123", "--dry-run"]);
+    expect(g.stdout).toContain("group 123");
+    const a = await run(["post", "hi", "--audience", "friends", "--dry-run"]);
+    expect(a.stdout).toContain("audience: friends");
+  });
+
+  test("a write action refuses to run non-interactively without --yes", async () => {
+    const { stderr, exitCode } = await run(["dm", "100", "hey"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("refusing to send a direct message to 100");
+    expect(stderr).toContain("aborted.");
+  });
+
+  test("read actions are never gated by the write guard", async () => {
+    // feed isn't a mutation, so it skips the guard and fails only for lack of cookies.
+    const { stderr, exitCode } = await run(["feed"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("error: no cookies.");
   });
 });

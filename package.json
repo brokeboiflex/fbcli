@@ -1,6 +1,6 @@
 {
   "name": "fbcli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cookie-only Facebook command-line client for your own account",
   "license": "MIT",
   "type": "module",
@@ -24,17 +24,25 @@
   },
   "scripts": {
     "fbcli": "bun run fbcli.ts",
-    "postinstall": "playwright install chromium",
     "typecheck": "tsc --noEmit",
     "test": "bun run test:unit && bun run test:browser",
-    "test:unit": "bun test test/cookies.test.ts test/helpers.test.ts test/cli.test.ts",
+    "test:unit": "bun test test/cookies.test.ts test/helpers.test.ts test/cli.test.ts test/browser-cookies.test.ts test/selectors.test.ts",
     "test:browser": "for f in test/read-actions.test.ts test/write-actions.test.ts test/find-students.test.ts; do bun test \"$f\" || exit 1; done"
   },
   "dependencies": {
+    "playwright-core": "^1.40.0"
+  },
+  "peerDependencies": {
     "playwright": "^1.40.0"
+  },
+  "peerDependenciesMeta": {
+    "playwright": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "playwright": "^1.40.0",
     "typescript": "^5.6.0"
   }
 }

@@ -23,15 +23,20 @@ extension works) to a file and pass --cookies, or set FBCLI_COOKIES.
 
 Examples:
   fbcli whoami
+  fbcli --cookies brave whoami
   fbcli feed --limit 15
   fbcli search "climbing gyms nairobi" --kind pages
-  fbcli post "Hello from my terminal"
-  fbcli post "Hi group" --group 123456789
+  fbcli --channel chrome post "Hello from my terminal"
+  fbcli post "Hi group" --group 123456789 --yes
+  fbcli post "friends only" --audience friends
   fbcli join 123456789
-  fbcli comment <post_url> "nice!"
+  fbcli comment <post_url> "nice!" --dry-run
   fbcli react <post_url> --reaction love
   fbcli notifications
-  fbcli dm 100000000000000 "hey"
+  fbcli dm 100000000000000 "hey" --yes
+
+Cookie source: a file, a 'c_user=..; xs=..' string, or a browser name
+(brave, chrome, chromium, edge, arc) to read that browser's own login.
 `.trim();
 
 function resolveCookies(arg: unknown): string {
@@ -66,13 +71,35 @@ export function buildParser(): ParserSpec {
       {
         flags: ["--cookies"],
         dest: "cookies",
-        help: "cookie file (json/netscape) or 'c_user=..; xs=..' string",
+        help: "cookie file (json/netscape), 'c_user=..; xs=..' string, or a browser name (brave/chrome/edge/arc)",
       },
       {
         flags: ["--headed"],
         dest: "headed",
         action: "storeTrue",
         help: "show the browser window (debug)",
+      },
+      {
+        flags: ["--channel"],
+        dest: "channel",
+        help: "launch a system browser by channel (chrome, msedge, …) instead of a download",
+      },
+      {
+        flags: ["--browser-path"],
+        dest: "browserPath",
+        help: "launch a specific browser binary",
+      },
+      {
+        flags: ["--dry-run"],
+        dest: "dryRun",
+        action: "storeTrue",
+        help: "for write actions: show what would happen, then exit without doing it",
+      },
+      {
+        flags: ["-y", "--yes"],
+        dest: "yes",
+        action: "storeTrue",
+        help: "skip the confirmation prompt for write actions",
       },
       {
         flags: ["--slow"],
@@ -139,6 +166,12 @@ export function buildParser(): ParserSpec {
         positionals: [{ dest: "text" }],
         options: [
           { flags: ["--group"], dest: "group", help: "group id/URL to post into" },
+          {
+            flags: ["--audience"],
+            dest: "audience",
+            choices: ["public", "friends", "only_me"],
+            help: "refuse to publish unless the composer audience matches (timeline posts only)",
+          },
         ],
       },
       {
@@ -194,6 +227,45 @@ export function buildParser(): ParserSpec {
   };
 }
 
+/** Write actions get a dry-run preview and a confirmation gate. */
+const MUTATIONS = new Set(["post", "comment", "react", "dm", "creategroup"]);
+
+/** A one-line human description of the write action about to run. */
+function describeMutation(args: ParsedArgs): string {
+  const s = (k: string): string => String(args[k] ?? "");
+  switch (args.cmd) {
+    case "post":
+      return args.group
+        ? `publish a post to group ${s("group")}`
+        : `publish a post to your timeline${args.audience ? ` (audience: ${s("audience")})` : ""}`;
+    case "comment":
+      return `comment on ${s("post")}`;
+    case "react":
+      return `react '${s("reaction")}' to ${s("post")}`;
+    case "dm":
+      return `send a direct message to ${s("thread")}`;
+    case "creategroup":
+      return `create a ${s("privacy")} group '${s("name")}'`;
+    default:
+      return `run ${args.cmd}`;
+  }
+}
+
+/** Return true to proceed. On a TTY, prompt; otherwise require --yes. */
+function confirmMutation(args: ParsedArgs): boolean {
+  if (args.yes === true) return true;
+  const desc = describeMutation(args);
+  if (!process.stdin.isTTY) {
+    console.error(
+      `refusing to ${desc} without confirmation — re-run with --yes ` +
+        `(or --dry-run to preview). This guard prevents accidental posts.`,
+    );
+    return false;
+  }
+  const ans = prompt(`About to ${desc}. Continue? [y/N]`);
+  return /^y(es)?$/i.test((ans ?? "").trim());
+}
+
 export async function run(args: ParsedArgs): Promise<number> {
   const asJson = args.json === true;
   const str = (key: string): string => String(args[key] ?? "");
@@ -204,10 +276,24 @@ export async function run(args: ParsedArgs): Promise<number> {
   const feedShow = (ps: A.Post[]): void =>
     console.log(ps.map((p) => p.brief()).join("\n\n") || "(nothing to show)");
 
+  // Gate write actions before we even launch a browser.
+  if (MUTATIONS.has(args.cmd)) {
+    if (args.dryRun === true) {
+      console.log(`[dry-run] would ${describeMutation(args)} — nothing sent.`);
+      return 0;
+    }
+    if (!confirmMutation(args)) {
+      console.error("aborted.");
+      return 1;
+    }
+  }
+
   const b = await Browser.start(resolveCookies(args.cookies), {
     headed: args.headed === true,
     slow: num("slow"),
     verbose: args.verbose === true,
+    channel: optional("channel") ?? undefined,
+    executablePath: optional("browserPath") ?? undefined,
   });
   try {
     switch (args.cmd) {
@@ -248,7 +334,7 @@ export async function run(args: ParsedArgs): Promise<number> {
         break;
       }
       case "post": {
-        const post = await A.postStatus(b, str("text"), optional("group"));
+        const post = await A.postStatus(b, str("text"), optional("group"), optional("audience"));
         emit(post, asJson, (p) => console.log("posted ✓\n" + p.brief()));
         break;
       }

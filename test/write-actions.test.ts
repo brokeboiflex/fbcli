@@ -13,10 +13,16 @@ const TIMEOUT = 120_000;
  * plus the two decoys the Python selectors were written to dodge — a background
  * inline editor and a dialog with no editor in it.
  */
-function composerPage(openerText: string, opts: { graphql?: boolean } = {}): string {
+function composerPage(
+  openerText: string,
+  opts: { graphql?: boolean; audience?: string } = {},
+): string {
   const fetchCall = opts.graphql
     ? `fetch('/api/graphql', {method:'POST',headers:{'x-fb-friendly-name':'ComposerStoryCreateMutation'}}).then(function(r){return r.text()}).then(finish)`
     : `finish()`;
+  const audienceBtn = opts.audience
+    ? `'<div id="aud" role="button" tabindex="0">${opts.audience}</div>' +`
+    : "";
   return page(`${RECORDER}
     <div role="main">
       <div id="opener" tabindex="0" style="padding:20px">${openerText}</div>
@@ -30,6 +36,7 @@ function composerPage(openerText: string, opts: { graphql?: boolean } = {}): str
         d.id = 'composer';
         d.setAttribute('role', 'dialog');
         d.innerHTML =
+          ${audienceBtn}
           '<div id="editor" role="textbox" contenteditable="true" style="height:60px"></div>' +
           '<div id="postbtn" role="button" tabindex="0" aria-disabled="true">Post</div>';
         document.body.appendChild(d);
@@ -152,6 +159,67 @@ describe("postStatus", () => {
         await expect(A.postStatus(b, "hi")).rejects.toThrow(
           "Could not open the post composer (layout changed?).",
         );
+      });
+    },
+    TIMEOUT,
+  );
+});
+
+describe("postStatus --audience guard", () => {
+  test(
+    "publishes when the composer audience matches",
+    async () => {
+      await withFakeFB(
+        { html: { "*": composerPage("What's on your mind?", { audience: "Friends" }) } },
+        async (b) => {
+          await A.postStatus(b, "friends only", null, "friends");
+          expect(await probe(b, "posted")).toBe("friends only");
+        },
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "refuses to publish when the audience does not match",
+    async () => {
+      await withFakeFB(
+        { html: { "*": composerPage("What's on your mind?", { audience: "Public" }) } },
+        async (b) => {
+          await expect(A.postStatus(b, "oops", null, "friends")).rejects.toThrow(
+            /Composer audience is 'Public', not 'Friends'/,
+          );
+          // The guard fires before the click, so nothing was published.
+          expect(await probe(b, "posted")).toBeUndefined();
+        },
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fails closed when the audience selector can't be read",
+    async () => {
+      await withFakeFB(
+        { html: { "*": composerPage("What's on your mind?") } }, // no audience button
+        async (b) => {
+          await expect(A.postStatus(b, "oops", null, "public")).rejects.toThrow(
+            /Could not read the composer audience/,
+          );
+          expect(await probe(b, "posted")).toBeUndefined();
+        },
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "rejects --audience on a group post",
+    async () => {
+      await withFakeFB({ html: { "*": composerPage("Write something") } }, async (b) => {
+        await expect(
+          A.postStatus(b, "hi", "https://www.facebook.com/groups/777/", "public"),
+        ).rejects.toThrow(/--audience applies to timeline posts/);
       });
     },
     TIMEOUT,

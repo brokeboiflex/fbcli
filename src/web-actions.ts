@@ -6,8 +6,9 @@
  * interaction has generous waits because the UI hydrates asynchronously.
  */
 
-import type { Locator, Response } from "playwright";
+import type { Locator, Response } from "playwright-core";
 import { type Browser, FBError } from "./browser.ts";
+import { SEL } from "./selectors.ts";
 
 /** Slice by code point, like Python's `s[:n]`, so emoji survive truncation. */
 export function cut(s: string, n: number): string {
@@ -141,7 +142,7 @@ export async function whoami(b: Browser): Promise<WhoAmI> {
   await b.settle(2500);
   // The account name is embedded in the page's Relay bootstrap data; this is
   // far more stable than the DOM, where the profile name isn't a plain heading.
-  const m = /"NAME":"([^"]{2,40})"/.exec(await b.page.content());
+  const m = new RegExp(SEL.nameFromBootstrap).exec(await b.page.content());
   const name = m ? decodeUnicodeEscape(m[1]!) : "(unknown)";
   return {
     uid: b.uid,
@@ -155,17 +156,14 @@ async function collectArticles(b: Browser, limit: number, scrolls = 6): Promise<
   const posts: Post[] = [];
   const seen = new Set<string>();
   for (let s = 0; s < scrolls; s++) {
-    const arts = b.page.locator('div[role="article"]');
+    const arts = b.page.locator(SEL.article);
     const n = await arts.count();
     for (let i = 0; i < n; i++) {
       const a = arts.nth(i);
       const txt = await tryInnerText(a, 1500);
       if (txt === null) continue;
       if (!txt || charLength(txt) < 3) continue;
-      const links = a.locator(
-        'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], ' +
-          'a[href*="/videos/"], a[href*="/groups/"][href*="/posts/"]',
-      );
+      const links = a.locator(SEL.permalinkLinks);
       const perma = await firstHref(links);
       const key = perma || cut(txt, 80);
       if (seen.has(key)) continue;
@@ -212,12 +210,12 @@ export async function readPost(b: Browser, url: string): Promise<[Post, string[]
   await b.page.waitForTimeout(1500);
   // The post body renders in a dir="auto" block (the article inner_text is
   // often empty). Take the longest such block inside the post dialog/main.
-  let scope = b.page.locator('[role="dialog"]').last();
+  let scope = b.page.locator(SEL.dialog).last();
   if (!(await scope.count())) {
-    scope = b.page.locator('[role="main"]').first();
+    scope = b.page.locator(SEL.main).first();
   }
   let text = "";
-  const blocks = scope.locator('div[dir="auto"]');
+  const blocks = scope.locator(SEL.bodyBlock);
   const nblocks = Math.min(await blocks.count(), 40);
   for (let i = 0; i < nblocks; i++) {
     const t = await tryInnerText(blocks.nth(i), 800);
@@ -229,7 +227,7 @@ export async function readPost(b: Browser, url: string): Promise<[Post, string[]
   const head = await tryInnerText(scope.getByRole("link").first(), 1500);
   if (head !== null) author = firstLine(head);
   const comments: string[] = [];
-  const cnodes = b.page.locator('div[aria-label*="Comment by"], div[role="article"]');
+  const cnodes = b.page.locator(SEL.commentNodes);
   const ncomments = Math.min(await cnodes.count(), 30);
   for (let i = 0; i < ncomments; i++) {
     const t = await tryInnerText(cnodes.nth(i), 800);
@@ -263,7 +261,7 @@ export async function search(
   // Result names aren't in the anchor text — they're in the avatar link's
   // aria-label ("Profile photo of <Name>"). Harvest per unique href.
   const best = new Map<string, string>();
-  const links = b.page.locator('[role="main"] a[role="link"][href]');
+  const links = b.page.locator(SEL.searchLinks);
   const nlinks = Math.min(await links.count(), 250);
   for (let i = 0; i < nlinks; i++) {
     const a = links.nth(i);
@@ -318,7 +316,7 @@ export async function notifications(b: Browser, limit = 15): Promise<Item[]> {
   const out: Item[] = [];
   const seen = new Set<string>();
   // Notifications render as role="listitem" rows (there is no role="main" here).
-  const rows = b.page.locator('[role="listitem"]');
+  const rows = b.page.locator(SEL.notificationRow);
   const nrows = Math.min(await rows.count(), 60);
   for (let i = 0; i < nrows; i++) {
     const row = rows.nth(i);
@@ -347,14 +345,51 @@ export async function notifications(b: Browser, limit = 15): Promise<Item[]> {
 // -- writing -----------------------------------------------------------------
 // Composer opener text differs by surface: timeline says "What's on your mind",
 // group pages say "Write something" / "Start a discussion" / "Discuss something".
-const OPENER =
-  /What'?s on your mind|Write something|Start a discussion|Discuss something|Say something/i;
+// (The pattern itself lives in the selector registry: SEL.composerOpener.)
 
-/** Open the 'Create post' dialog, type text, and click Post. */
-async function composeAndPublish(b: Browser, text: string): Promise<void> {
+/** Facebook's audience labels, keyed by the CLI's --audience choices. */
+const AUDIENCE_LABELS: Record<string, string> = {
+  public: "Public",
+  friends: "Friends",
+  only_me: "Only me",
+};
+
+/**
+ * Refuse to publish unless the composer's current audience matches `audience`.
+ * fbcli never *changes* the audience (that risks silently widening a post); it
+ * only verifies, and fails closed if it can't read the selector.
+ */
+async function verifyAudience(dialog: Locator, audience: string): Promise<void> {
+  const want = AUDIENCE_LABELS[audience.toLowerCase()];
+  if (!want) throw new FBError(`Unknown audience '${audience}'.`);
+  const btn = dialog.getByRole("button", { name: SEL.audienceButton }).first();
+  let current: string;
+  try {
+    await btn.waitFor({ state: "visible", timeout: 6000 });
+    current = (await btn.innerText()).trim();
+  } catch {
+    throw new FBError(
+      `Could not read the composer audience to confirm '${want}' — refusing to ` +
+        `publish. Re-run with --headed and set it yourself, or drop --audience.`,
+    );
+  }
+  if (current.toLowerCase() !== want.toLowerCase()) {
+    throw new FBError(
+      `Composer audience is '${current}', not '${want}' — refusing to publish. ` +
+        `Set the audience to ${want} on Facebook first (fbcli won't change it), then retry.`,
+    );
+  }
+}
+
+/** Open the 'Create post' dialog, type text, verify audience, and click Post. */
+async function composeAndPublish(
+  b: Browser,
+  text: string,
+  audience?: string | null,
+): Promise<void> {
   // Pick the first *visible* opener (group pages have hidden/overlaid matches),
   // scroll it clear of sticky panels, then force-click through any overlay.
-  const openers = b.page.getByText(OPENER);
+  const openers = b.page.getByText(SEL.composerOpener);
   let opener = openers.first();
   const nopeners = Math.min(await openers.count(), 8);
   for (let i = 0; i < nopeners; i++) {
@@ -385,7 +420,7 @@ async function composeAndPublish(b: Browser, text: string): Promise<void> {
     const n = await dialogs.count();
     for (let i = 0; i < n; i++) {
       const d = dialogs.nth(i);
-      const ed = d.locator('div[role="textbox"], div[contenteditable="true"]').first();
+      const ed = d.locator(SEL.editor).first();
       try {
         if ((await ed.count()) && (await ed.isVisible())) return [d, ed];
       } catch {
@@ -421,8 +456,10 @@ async function composeAndPublish(b: Browser, text: string): Promise<void> {
   }
   await b.page.keyboard.type(text, { delay: 15 });
   await b.page.waitForTimeout(1000);
+  // Audience gate (timeline posts only): confirm before anything is published.
+  if (audience) await verifyAudience(dialog, audience);
   // The Post button (inside the dialog) enables once the editor has content.
-  const btn = dialog.getByRole("button", { name: /^Post$/i }).last();
+  const btn = dialog.getByRole("button", { name: SEL.postButton }).last();
   await btn.waitFor({ state: "visible", timeout: 8000 });
   for (let i = 0; i < 15; i++) {
     if (await btn.isEnabled()) break;
@@ -470,8 +507,14 @@ export async function postStatus(
   b: Browser,
   text: string,
   group?: string | null,
+  audience?: string | null,
 ): Promise<Post> {
   if (group) {
+    if (audience) {
+      throw new FBError(
+        "--audience applies to timeline posts; a group post's audience is the group itself.",
+      );
+    }
     await b.goto(groupUrl(group));
   } else {
     await b.goto("/");
@@ -520,7 +563,7 @@ export async function postStatus(
   };
 
   b.page.on("response", onResp);
-  await composeAndPublish(b, text);
+  await composeAndPublish(b, text, audience);
   await b.page.waitForTimeout(3500);
   b.page.off("response", onResp);
   await Promise.allSettled(pending);
@@ -542,12 +585,7 @@ export async function postStatus(
 export async function comment(b: Browser, url: string, text: string): Promise<string> {
   await b.goto(url);
   await b.settle(3500);
-  const box = b.page
-    .locator(
-      'div[aria-label^="Comment"], div[aria-label*="Write a comment"], ' +
-        'form div[role="textbox"], div[contenteditable="true"]',
-    )
-    .first();
+  const box = b.page.locator(SEL.commentBox).first();
   await box.waitFor({ state: "visible", timeout: 10000 });
   await box.click();
   await box.pressSequentially(text, { delay: 15 });
@@ -562,7 +600,7 @@ export type Reaction = "like" | "love" | "care" | "haha" | "wow" | "sad" | "angr
 export async function react(b: Browser, url: string, reaction = "like"): Promise<string> {
   await b.goto(url);
   await b.settle(3500);
-  const like = b.page.getByRole("button", { name: /^Like$/i }).first();
+  const like = b.page.getByRole("button", { name: SEL.likeButton }).first();
   await like.waitFor({ state: "visible", timeout: 10000 });
   if (reaction.toLowerCase() === "like" || reaction === "") {
     await like.click();
@@ -618,7 +656,7 @@ export async function createGroup(
     .first()
     .click({ timeout: 6000 });
   await b.page.waitForTimeout(1000);
-  const btn = b.page.getByRole("button", { name: /^Create/i }).first();
+  const btn = b.page.getByRole("button", { name: SEL.createButton }).first();
   for (let i = 0; i < 15; i++) {
     if (await btn.isEnabled()) break;
     await b.page.waitForTimeout(400);
@@ -641,13 +679,13 @@ export async function createGroup(
 export async function joinGroup(b: Browser, group: string): Promise<string> {
   await b.goto(groupUrl(group));
   await b.settle(3500);
-  const btn = b.page.getByRole("button", { name: /^(Join group|Join)$/i }).first();
+  const btn = b.page.getByRole("button", { name: SEL.joinButton }).first();
   try {
     await btn.click({ timeout: 8000 });
     await b.page.waitForTimeout(2500);
     return "join clicked (request sent or joined)";
   } catch {
-    if (await b.page.getByRole("button", { name: /Joined|Leave group/i }).count()) {
+    if (await b.page.getByRole("button", { name: SEL.joinedButton }).count()) {
       return "already a member";
     }
     throw new FBError("No Join button found (group may be secret/invite-only).");
@@ -657,16 +695,16 @@ export async function joinGroup(b: Browser, group: string): Promise<string> {
 export async function leaveGroup(b: Browser, group: string): Promise<string> {
   await b.goto(groupUrl(group));
   await b.settle(3500);
-  const joined = b.page.getByRole("button", { name: /Joined|Leave group/i }).first();
+  const joined = b.page.getByRole("button", { name: SEL.joinedButton }).first();
   await joined.click({ timeout: 8000 });
   await b.page.waitForTimeout(1200);
-  const confirm = b.page.getByRole("menuitem", { name: /Leave group/i }).first();
+  const confirm = b.page.getByRole("menuitem", { name: SEL.leaveMenuItem }).first();
   try {
     await confirm.click({ timeout: 4000 });
   } catch {
     // the menu item isn't always there — the dialog button below is
   }
-  await b.page.getByRole("button", { name: /^Leave/i }).first().click({ timeout: 6000 });
+  await b.page.getByRole("button", { name: SEL.leaveButton }).first().click({ timeout: 6000 });
   await b.page.waitForTimeout(2000);
   return "left group";
 }
@@ -675,7 +713,7 @@ export async function sendMessage(b: Browser, thread: string, text: string): Pro
   const dest = /^\d+$/.test(thread) ? thread : thread.replace(/^\/+/, "");
   await b.goto(`/messages/t/${dest}`);
   await b.settle(4000);
-  const box = b.page.getByRole("textbox", { name: /Message|Aa/i }).first();
+  const box = b.page.getByRole("textbox", { name: SEL.messageBox }).first();
   await box.waitFor({ state: "visible", timeout: 12000 });
   await box.click();
   await box.pressSequentially(text, { delay: 15 });
