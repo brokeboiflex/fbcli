@@ -7,19 +7,14 @@ cookies*.json
 secrets*
 *.secret
 
-# --- python ---
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-env/
-*.egg-info/
-.eggs/
-build/
+# --- bun / node ---
+node_modules/
 dist/
-.pytest_cache/
-.mypy_cache/
+build/
+*.tsbuildinfo
+.bun/
+npm-debug.log*
+bun-debug.log*
 
 # --- playwright / browser artifacts ---
 playwright-report/

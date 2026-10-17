@@ -2,7 +2,9 @@
 
 **A command-line client for your own Facebook account — authenticated with nothing but your browser session cookies.**
 
-No Graph API app, no developer registration, no password stored in the tool. `fbcli` injects your exported cookies into a headless Chromium (via [Playwright](https://playwright.dev/python/)) and drives the **real Facebook web UI**, so it can read your feed, search, post to your timeline or a group, comment, react, and manage group membership — all from your terminal.
+No Graph API app, no developer registration, no password stored in the tool. `fbcli` injects your exported cookies into a headless Chromium (via [Playwright](https://playwright.dev/)) and drives the **real Facebook web UI**, so it can read your feed, search, post to your timeline or a group, comment, react, and manage group membership — all from your terminal.
+
+Written in TypeScript and run directly by [Bun](https://bun.com) — no build step, no transpile, no `node_modules` juggling beyond `bun install`.
 
 ```console
 $ fbcli whoami
@@ -27,6 +29,8 @@ posted ✓
 - [Command reference](#command-reference)
 - [Global flags](#global-flags)
 - [How it works](#how-it-works)
+- [Using it as a library](#using-it-as-a-library)
+- [Development](#development)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
 - [Legal & safety](#legal--safety)
@@ -41,7 +45,7 @@ Facebook has **retired every no-JavaScript HTML interface**:
 - `mbasic.facebook.com` — gone (serves *"Facebook is not available on this browser"*).
 - `m.facebook.com` / `www.facebook.com` — render the feed, search, and composer entirely through **client-side GraphQL** calls whose `doc_id` values Facebook rotates every few days.
 
-A plain `requests` + HTML-scraper can't drive that and breaks constantly. A real
+A plain `fetch` + HTML-scraper can't drive that and breaks constantly. A real
 browser runs Facebook's own JavaScript, so it keeps working across redesigns.
 `fbcli` therefore automates a headless Chromium with your cookies loaded, and
 targets the UI through **stable ARIA roles** (`article`, `dialog`, `textbox`,
@@ -51,30 +55,32 @@ targets the UI through **stable ARIA roles** (`article`, `dialog`, `textbox`,
 
 ## Install
 
-Requires **Python 3.9+**.
+Requires **[Bun](https://bun.com) 1.1+**. (Install it with `curl -fsSL https://bun.com/install | bash`.)
 
 ```bash
 git clone https://github.com/0xEnc0der/fbcli.git
 cd fbcli
 
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-
-pip install -r requirements.txt
-python -m playwright install chromium   # one-time, ~150 MB browser download
+bun install    # also downloads Chromium (~150 MB) via Playwright's postinstall
 ```
 
-Optional — install the `fbcli` command onto your PATH:
+If you skipped the postinstall or need the browser again:
 
 ```bash
-pip install -e .
+bunx playwright install chromium
 ```
 
-Without the editable install you run it as `python fbcli.py <command>`.
+Optional — put the `fbcli` command on your PATH:
+
+```bash
+bun link
+```
+
+Without `bun link` you run it as `bun run fbcli.ts <command>`.
 
 > **WSL / headless Linux:** Chromium runs with `--no-sandbox --disable-dev-shm-usage`
 > automatically. If launch fails, install system libs with
-> `sudo python -m playwright install-deps chromium`.
+> `sudo bunx playwright install-deps chromium`.
 
 ---
 
@@ -236,7 +242,7 @@ fbcli leave 123456789012345
 |---|---|
 | `--cookies <file\|string>` | Cookie source (or set `FBCLI_COOKIES`) |
 | `--headed` | Show the browser window — invaluable for debugging selectors |
-| `--slow <ms>` | Add `slow_mo` delay between UI actions |
+| `--slow <ms>` | Add `slowMo` delay between UI actions |
 | `--json` | Machine-readable JSON output (read commands) |
 | `--verbose` | Log each navigation |
 | `--version` | Print version |
@@ -258,6 +264,66 @@ fbcli leave 123456789012345
 
 ---
 
+## Using it as a library
+
+Every command is a plain async function over an open `Browser`, so you can
+script flows Bun-side instead of shelling out:
+
+```ts
+import { Browser, webActions as fb } from "fbcli";
+
+const b = await Browser.start(process.env.FBCLI_COOKIES!, { verbose: true });
+try {
+  console.log(await fb.whoami(b));
+  for (const post of await fb.feed(b, 5)) console.log(post.brief());
+  const published = await fb.postStatus(b, "hello from a script");
+  await fb.comment(b, published.permalink, "…and a comment");
+} finally {
+  await b.close();
+}
+```
+
+`Browser` also implements `Symbol.asyncDispose`, so with explicit resource
+management you can drop the `try`/`finally`:
+
+```ts
+await using b = await Browser.start(process.env.FBCLI_COOKIES!);
+console.log(await fb.whoami(b));
+```
+
+---
+
+## Development
+
+```bash
+bun run typecheck      # tsc --noEmit
+bun run test           # everything (~5 min)
+bun run test:unit      # cookies, pure helpers, CLI surface (~1s)
+bun run test:browser   # the Chromium integration suites, one file per process
+bun test test/cookies.test.ts
+```
+
+The integration suites (`test/read-actions.test.ts`, `test/write-actions.test.ts`,
+`test/find-students.test.ts`) drive a real Chromium against
+`test/fake-facebook.ts` — a request-intercepting stand-in for facebook.com — so
+every selector and UI flow is exercised without an account or a network call.
+
+They inherit the production code's deliberate patience (it waits on Facebook's
+async hydration), so they are slow — a few minutes in total.
+
+**Run the browser suites one file at a time.** Each file passes reliably on its
+own, but `bun test` loads all of them into a single Bun process, and after
+roughly forty Chromium launches in one process Playwright protocol calls start
+stalling indefinitely — a test whose worst case is fifteen seconds will sit
+there until the per-test timeout fires. This is a Bun/Playwright interaction,
+not a defect in the code under test: the same tests pass every time when the
+file runs in a fresh process.
+
+That is what `bun run test:browser` does, and why `bun run test` is the
+supported entry point rather than a bare `bun test`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -265,8 +331,9 @@ fbcli leave 123456789012345
 | `auth error: … redirected to login/checkpoint` | Cookies expired or a security check is pending — re-export fresh cookies from a logged-in browser. |
 | `Missing essential cookie(s): c_user, xs` | Your export didn't include the session cookies. Re-export and make sure you're logged in. |
 | A read command returns `(nothing to show)` | Could be genuinely empty (e.g. a new account with no friends), or a selector drifted — run with `--headed` to watch. |
-| `Could not open the post composer` | Facebook changed the composer; run `--headed --slow 300` to observe, then adjust `fbcli/web_actions.py`. |
-| Chromium won't launch (Linux) | `sudo python -m playwright install-deps chromium` |
+| `Could not open the post composer` | Facebook changed the composer; run `--headed --slow 300` to observe, then adjust `src/web-actions.ts`. |
+| `browserType.launch: Executable doesn't exist` | `bunx playwright install chromium` |
+| Chromium won't launch (Linux) | `sudo bunx playwright install-deps chromium` |
 
 Run any command with `--headed --verbose` to watch the browser and see each
 navigation as it happens.
@@ -289,6 +356,10 @@ private `doc_id`s.
 **Can it upload photos / videos?** Not yet — this is a text-first client.
 Contributions welcome.
 
+**Does it run on Node instead of Bun?** The code is standard ESM TypeScript and
+Playwright works on both, but the `.ts` entry points assume Bun's built-in
+TypeScript loader. On Node you'd need a loader or a build step.
+
 ---
 
 ## Legal & safety
@@ -308,14 +379,25 @@ The software is provided **as-is**, without warranty (see [LICENSE](LICENSE)).
 ## Project layout
 
 ```
-fbcli/
-  browser.py      Playwright engine: cookie injection, navigation, login guard
-  web_actions.py  every command's UI flow (read + write)
-  cli.py          argparse command surface
-  __init__.py
-fbcli.py          standalone launcher — `python fbcli.py ...`
-pyproject.toml    packaging + `fbcli` entry point
-requirements.txt  runtime dependency (playwright)
+src/
+  browser.ts        Playwright engine: cookie injection, navigation, login guard
+  web-actions.ts    every command's UI flow (read + write)
+  cli.ts            command surface + output formatting
+  argparse.ts       the small argparse-shaped parser the CLI is declared with
+  index.ts          public exports
+  version.ts        the version string the CLI reports
+test/
+  cookies.test.ts       all four cookie formats
+  helpers.test.ts       pure helpers, checked against Python's reference output
+  read-actions.test.ts  feed/timeline/search/notifications/read in real Chromium
+  write-actions.test.ts post/comment/react/join/leave/dm/creategroup likewise
+  cli.test.ts           the command surface + the fbcli executable itself
+  find-students.test.ts the group post-id extractors
+  fake-facebook.ts      the request-intercepting facebook.com stand-in
+fbcli.ts            standalone launcher — `bun run fbcli.ts ...`
+fb-find-students.ts group post finder (extracts permalinks from page JSON)
+package.json        deps + the `fbcli` bin entry
+tsconfig.json       strict TypeScript config
 ```
 
 ---
