@@ -224,21 +224,34 @@ async function readStoryCard(card: Locator): Promise<RawStory> {
         if (author) break;
       }
 
-      // A story's own timestamp link is JS-obfuscated, so often the only hrefs
-      // in the card belong to its comment previews — and those point at this
-      // very post, with a `comment_id` query we drop. Hence the fallback.
+      // A story's own timestamp link is JS-obfuscated, so a fresh post often
+      // has no link to itself anywhere in the card. Three places to look, in
+      // descending order of directness — and an empty permalink is fine, a
+      // post nobody has answered yet is still the post we came for.
       let permalink = "";
       let viaComment = "";
       for (const link of Array.from(root.querySelectorAll(sel.permalink))) {
         const href = (link as HTMLAnchorElement).href.split("?")[0]!;
         if (inComment(link)) {
+          // A comment's link points at this very post, plus a `comment_id`.
           viaComment ||= href;
           continue;
         }
         permalink = href;
         break;
       }
-      return { author, text, permalink: permalink || viaComment };
+      // A photo in a group post carries `set=gm.<post id>&idorvanity=<group>`.
+      let viaPhoto = "";
+      for (const link of Array.from(root.querySelectorAll(sel.groupPhoto))) {
+        if (inComment(link)) continue;
+        const q = new URL((link as HTMLAnchorElement).href).searchParams;
+        const post = /^gm\.(\d+)$/.exec(q.get("set") ?? "")?.[1];
+        const group = q.get("idorvanity");
+        if (!post || !group) continue;
+        viaPhoto = `https://www.facebook.com/groups/${group}/posts/${post}/`;
+        break;
+      }
+      return { author, text, permalink: permalink || viaComment || viaPhoto };
     },
     {
       body: SEL.bodyBlock,
@@ -246,6 +259,7 @@ async function readStoryCard(card: Locator): Promise<RawStory> {
       author: SEL.storyAuthor,
       authorAny: SEL.storyAuthorAny,
       permalink: SEL.permalinkLinks,
+      groupPhoto: SEL.groupPhotoLinks,
     },
   );
 }
@@ -282,13 +296,15 @@ async function collectStories(b: Browser, limit: number, scrolls = 8): Promise<P
       } catch {
         continue; // the card was recycled out of the DOM mid-read
       }
-      // Every real story carries a link to itself; the sort control, the
-      // composer and the join/suggestion cards do not.
-      if (!story.permalink) continue;
-      // A photo- or video-only post has no body, but its author still does.
-      if (charLength(story.text) < 3 && !story.author) continue;
-      if (seen.has(story.permalink)) continue;
-      seen.add(story.permalink);
+      // Every real story names its poster; the sort control, the composer and
+      // the join/suggestion cards have no author. Don't ask for a permalink —
+      // the newest posts, the ones nobody has replied to yet, have none.
+      if (!story.author) continue;
+      // Identify a story by its link when it has one, and by what it says when
+      // it doesn't, so a card re-read after a scroll isn't counted twice.
+      const keys = [story.permalink, `${story.author}|${cut(story.text, 80)}`].filter(Boolean);
+      if (keys.some((k) => seen.has(k))) continue;
+      for (const k of keys) seen.add(k);
       posts.push(new Post(story));
       if (posts.length >= limit) return posts;
     }

@@ -30,6 +30,8 @@ export interface SelectorDefs {
   storyAuthorAny: string;
   /** Links inside a story that point at its permalink. */
   permalinkLinks: string;
+  /** A group photo link, whose `set=gm.<id>` names the post it belongs to. */
+  groupPhotoLinks: string;
   /** The post-detail overlay (read view). */
   dialog: string;
   /** The main column when there is no overlay. */
@@ -81,6 +83,7 @@ export const DEFAULT_SELECTORS: SelectorDefs = {
   permalinkLinks:
     'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], ' +
     'a[href*="/videos/"], a[href*="/groups/"][href*="/posts/"]',
+  groupPhotoLinks: 'a[href*="set=gm."]',
   dialog: '[role="dialog"]',
   main: '[role="main"]',
   bodyBlock: 'div[dir="auto"]',

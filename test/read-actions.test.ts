@@ -160,8 +160,24 @@ function groupCard(author: string, body: string, href: string, comment: string):
   </div>`;
 }
 
+// The newest post of all: nobody has replied yet, and a story's own timestamp
+// link is JS-obfuscated, so the card holds no link to itself at all.
+function freshCard(author: string, body: string, photoSet = ""): string {
+  const photo = photoSet
+    ? `<a href="https://www.facebook.com/photo/?fbid=1&set=${photoSet}&idorvanity=7">May be an image</a>`
+    : "";
+  return `<div>
+    <h3><a href="/user/9/">${author}</a></h3>
+    <div dir="auto">${body}</div>
+    <a href="?__cft__[0]=obfuscated">2m</a>
+    ${photo}
+  </div>`;
+}
+
 const GROUP = page(`${RECORDER}<div role="main"><div role="feed">
   <div><div dir="auto">sort group feed by</div></div>
+  ${freshCard("Light House Agency", "10 000 zł miesięcznie na Google Ads")}
+  ${freshCard("Carol", "a photo post", "gm.333")}
   ${groupCard("Alice", "the group post body", "/groups/7/posts/111", "a comment that is much, much longer than the post itself")}
   ${groupCard("Bob", "another group post", "/groups/7/posts/222", "short reply")}
 </div></div>`);
@@ -172,13 +188,22 @@ describe("groupFeed", () => {
     async () => {
       await withFakeFB({ html: { "*": GROUP } }, async (b) => {
         const posts = await A.groupFeed(b, "7", 10);
-        // The sort control has no permalink of its own, so it is not a story.
+        // The sort control names no author, so it is not a story.
         expect(posts.map((p) => p.text)).toEqual([
+          "10 000 zł miesięcznie na Google Ads",
+          "a photo post",
           "the group post body",
           "another group post",
         ]);
-        expect(posts.map((p) => p.author)).toEqual(["Alice", "Bob"]);
-        expect(posts[0]!.permalink).toBe("https://www.facebook.com/groups/7/posts/111");
+        expect(posts.map((p) => p.author)).toEqual([
+          "Light House Agency", "Carol", "Alice", "Bob",
+        ]);
+        // A post with no link to itself is still reported, without one.
+        expect(posts[0]!.permalink).toBe("");
+        // A photo's `set=gm.<id>` recovers the permalink the timestamp hides.
+        expect(posts[1]!.permalink).toBe("https://www.facebook.com/groups/7/posts/333/");
+        // Otherwise the story's own link wins over its comments'.
+        expect(posts[2]!.permalink).toBe("https://www.facebook.com/groups/7/posts/111");
       });
     },
     TIMEOUT,
